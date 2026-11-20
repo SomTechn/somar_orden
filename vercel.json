@@ -3,7 +3,7 @@
   "rewrites": [
     {
       "source": "/o/:token",
-      "destination": "/orden.html"
+      "destination": "/orden"
     }
   ],
   "headers": [
