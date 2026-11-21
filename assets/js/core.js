@@ -57,35 +57,81 @@ function estadoEntrega(o) {
    Suma las horas de trabajo pendientes del taller (cola) y las de la orden nueva, repartidas entre
    las personas que trabajan a la vez (capacidad), y avanza solo por las horas en que el taller abre.
    Las urgentes solo esperan detrás de otras urgentes y tardan menos (reduccion_urgente %). */
-function horasAbiertas(neg, desde, horas) {
-  const H = neg.horario || {};
-  if (!Object.keys(H).length) { const d = new Date(desde); d.setHours(d.getHours() + Math.ceil(horas)); return d; }
-  let t = new Date(desde), resta = horas * 60, vueltas = 0;
-  while (resta > 0 && vueltas++ < 400) {
-    const h = H[t.getDay()];
-    if (h) {
-      const abre = new Date(t); abre.setHours(h[0], 0, 0, 0);
-      const cierra = new Date(t); cierra.setHours(h[1], 0, 0, 0);
-      if (t < abre) t = abre;
-      if (t < cierra) {
-        const libre = (cierra - t) / 60000;
-        if (libre >= resta) { t = new Date(t.getTime() + resta * 60000); resta = 0; break; }
-        resta -= libre;
-      }
+const inicioDia = d => { d = new Date(d); d.setHours(0, 0, 0, 0); return d; };
+/* Tramos libres de un día: horas en que abre, menos los tiempos muertos */
+function tramosDia(neg, dia, paradas = []) {
+  const h = (neg.horario || {})[dia.getDay()]; if (!h) return [];
+  const a = new Date(dia); a.setHours(h[0], 0, 0, 0); const c = new Date(dia); c.setHours(h[1], 0, 0, 0);
+  let tramos = [[a.getTime(), c.getTime()]];
+  for (const p of paradas) {
+    const pi = new Date(p.inicio).getTime(), pf = new Date(p.fin).getTime(), out = [];
+    for (const [x, y] of tramos) {
+      if (pf <= x || pi >= y) { out.push([x, y]); continue; }
+      if (pi > x) out.push([x, pi]);
+      if (pf < y) out.push([pf, y]);
     }
-    t = new Date(t); t.setDate(t.getDate() + 1); t.setHours(0, 0, 0, 0);
+    tramos = out;
   }
-  // Redondea a la siguiente media hora
-  const m = t.getMinutes(); if (m % 30) t.setMinutes(m + (30 - m % 30), 0, 0); else t.setSeconds(0, 0);
-  return t;
+  return tramos;
 }
-function fechaSugerida(neg, horasNueva, urgente, pendientes) {
-  const red = urgente ? (1 - (neg.reduccion_urgente || 0) / 100) : 1;
-  const cola = pendientes.filter(o => !urgente || o.urgente).reduce((a, o) => a + (o.horas || 0) * (o.urgente ? (1 - (neg.reduccion_urgente || 0) / 100) : 1), 0);
+/* Avanza "horas" de trabajo desde "desde", solo dentro del horario y fuera de los tiempos muertos */
+function horasAbiertas(neg, desde, horas, paradas = []) {
+  const H = neg.horario || {};
+  let t = new Date(desde).getTime(), resta = Math.max(0, horas) * 60000 * 60;
+  if (!Object.keys(H).length) return new Date(t + resta);
+  let dia = inicioDia(t), vueltas = 0;
+  while (vueltas++ < 500) {
+    for (const [x, y] of tramosDia(neg, dia, paradas)) {
+      if (y <= t) continue;
+      const s = Math.max(x, t), libre = y - s;
+      if (libre >= resta) return redondear30(new Date(s + resta));
+      resta -= libre; t = y;
+    }
+    dia = new Date(dia); dia.setDate(dia.getDate() + 1);
+  }
+  return new Date(t);
+}
+function redondear30(d) { d = new Date(d); const m = d.getMinutes(), extra = (d.getSeconds() || d.getMilliseconds()) ? 1 : 0; if (m % 30 || extra) d.setMinutes(m - (m % 30) + 30, 0, 0); else d.setSeconds(0, 0); return d; }
+/* Minutos de trabajo que se pierden entre a y b (solo cuenta horas en que el taller abre) */
+function minutosAbiertosEntre(neg, a, b) {
+  a = new Date(a).getTime(); b = new Date(b).getTime(); let total = 0, dia = inicioDia(a), v = 0;
+  while (dia.getTime() < b && v++ < 400) {
+    for (const [x, y] of tramosDia(neg, dia)) { const s = Math.max(x, a), e = Math.min(y, b); if (e > s) total += e - s; }
+    dia = new Date(dia); dia.setDate(dia.getDate() + 1);
+  }
+  return Math.round(total / 60000);
+}
+/* Fecha sugerida: cola del taller repartida entre las personas que trabajan a la vez, más la orden nueva.
+   Las urgentes solo esperan detrás de otras urgentes y tardan menos (reduccion_urgente %). */
+function fechaSugerida(neg, horasNueva, urgente, pendientes, paradas = []) {
+  const red = 1 - (neg.reduccion_urgente || 0) / 100;
+  const cola = pendientes.filter(o => !urgente || o.urgente).reduce((a, o) => a + (o.horas || 0) * (o.urgente ? red : 1), 0);
   const cap = Math.max(1, neg.capacidad || 1);
-  const total = cola / cap + Math.max(0.5, horasNueva * red);
-  return horasAbiertas(neg, new Date(), total);
+  return horasAbiertas(neg, new Date(), cola / cap + Math.max(0.5, horasNueva * (urgente ? red : 1)), paradas);
 }
+/* Hasta cuándo está comprometido el taller con el trabajo que ya tiene */
+function comprometidoHasta(neg, pendientes, paradas = []) {
+  const red = 1 - (neg.reduccion_urgente || 0) / 100;
+  const horas = pendientes.reduce((a, o) => a + (o.horas || 0) * (o.urgente ? red : 1), 0);
+  return { horas, fecha: horas > 0 ? horasAbiertas(neg, new Date(), horas / Math.max(1, neg.capacidad || 1), paradas) : null };
+}
+
+/* ---------- Contabilidad ---------- */
+const CAT_FIJO = ['Alquiler', 'Energía', 'Agua', 'Internet y teléfono', 'Sueldos', 'Préstamo', 'Otro'];
+const CAT_VAR = ['Tela', 'Hilos', 'Botones y zíperes', 'Entretela y forros', 'Transporte', 'Otro material'];
+const MOTIVOS_PARADA = ['Se fue la energía', 'Comprar material', 'Enfermedad', 'Máquina dañada', 'Feriado o cierre', 'Otro'];
+const ultimoDia = (y, m) => new Date(y, m + 1, 0).getDate();
+/* Vencimientos de un pago fijo en un mes (m = 0..11) */
+function vencimientos(pf, y, m) {
+  const ud = ultimoDia(y, m), mm = pad(m + 1);
+  if (pf.frecuencia === 'quincenal') {
+    const d1 = pf.dia <= 15 ? pf.dia : pf.dia - 15, d2 = d1 + 15;
+    return [{ periodo: `${y}-${mm}-1`, fecha: new Date(y, m, Math.min(d1, ud)) }, { periodo: `${y}-${mm}-2`, fecha: new Date(y, m, Math.min(d2, ud)) }];
+  }
+  return [{ periodo: `${y}-${mm}`, fecha: new Date(y, m, Math.min(pf.dia, ud)) }];
+}
+const mensualEquiv = pf => Number(pf.monto) * (pf.frecuencia === 'quincenal' ? 2 : 1);
+const MESES_L = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'];
 
 /* ---------- WhatsApp ---------- */
 const waLink = (tel, texto) => 'https://wa.me/504' + digitos(tel) + '?text=' + encodeURIComponent(texto);
@@ -183,6 +229,8 @@ const IC = {
   salir: sv('<path d="M15 4h4v16h-4M10 8l-4 4 4 4M6 12h10"/>'),
   ok: sv('<path d="m5 12 5 5L20 7"/>'),
   tijera: sv('<circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M8.1 8.1 20 20M8.1 15.9 20 4"/>'),
+  imagen: sv('<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="m21 16-5-5-8 9"/>'),
+  grafica: sv('<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>'),
   copiar: sv('<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>'),
 };
 
